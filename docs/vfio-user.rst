@@ -45,6 +45,14 @@ While passing of file descriptors is desirable for performance reasons, support
 is not necessary for either the client or the server in order to implement the
 protocol. There is always an in-band, message-passing fall back mechanism.
 
+.. note::
+
+   Specification review draft: upstream protocol 0.2 is the baseline. The
+   message-based IRQ additions marked "added in version 0.3" below are proposed
+   amendments, not a claim that they are implemented or assigned upstream.
+   Numeric allocations must be confirmed before upstream submission. TCP
+   twin-socket negotiation is a separate future specification change.
+
 Overview
 ========
 
@@ -162,7 +170,13 @@ for the device's interrupt types. The interrupt types are specific to the bus
 the device is attached to, and the client is expected to know the capabilities
 of each interrupt type. The server can signal an interrupt by directly injecting
 interrupts into the guest via an event file descriptor. The client configures
-how the server signals an interrupt with ``VFIO_USER_SET_IRQS`` messages.
+how the server signals an interrupt with ``VFIO_USER_DEVICE_SET_IRQS`` messages.
+
+Message-based delivery is also available when negotiated (added in version
+0.3). The client explicitly configures it with ``VFIO_USER_DEVICE_SET_IRQS``;
+subsequent ``VFIO_USER_DEVICE_IRQ_TRIGGER`` commands notify the client of actual
+interrupt events. Configuration and notification are distinct operations.
+See `Message-based IRQ delivery`_.
 
 Device Read and Write
 ^^^^^^^^^^^^^^^^^^^^^
@@ -209,10 +223,18 @@ other direction from the server to the client as well as their corresponding
 replies can optionally be passed across a separate socket, which is set up
 during negotiation (AF_UNIX servers just pass the file descriptor).
 
-Using separate sockets for each command channel avoids introducing an
-artificial point of synchronization between the channels. This simplifies
-implementations since it obviates the need to demultiplex incoming messages
-into commands and replies and interleave command handling and reply processing.
+As an exception, ``VFIO_USER_DEVICE_IRQ_TRIGGER`` notifications always use the
+main socket, including when twin-socket mode is negotiated (added in version
+0.3). This orders IRQ notifications relative to replies to IRQ configuration
+and reset commands; see `Message-based IRQ ordering`_. DMA requests and their
+replies continue to use the negotiated server-command channel. Message IRQ
+support does not require twin-socket support.
+
+Using separate sockets for DMA command traffic avoids introducing an
+artificial point of synchronization between the channels. This simplifies DMA
+implementations by separating DMA requests and replies from client-originated
+commands. When message IRQs are negotiated, the client must still demultiplex
+IRQ events and replies on the main socket and process them in stream order.
 Note that it is still illegal for implementations to stall command or reply
 processing indefinitely while waiting for replies on the other channel, as this
 may lead to deadlocks. However, since incoming commands and requests arrive on
@@ -299,6 +321,9 @@ respond to a client disconnection as follows:
  - all client memory regions are unmapped and cleaned up (including closing any
    passed file descriptors)
  - all IRQ file descriptors passed from the old client are closed
+ - all message IRQ delivery registrations and negotiated IRQ capability state
+   are cleared; notifications are not replayed into a new session (added in
+   version 0.3)
  - the device state should otherwise be retained
 
 The expectation is that when a client reconnects, it will re-establish IRQ and
@@ -387,6 +412,7 @@ Name                                    Command    Request Direction
 ``VFIO_USER_DEVICE_FEATURE``            16         client -> server
 ``VFIO_USER_MIG_DATA_READ``             17         client -> server
 ``VFIO_USER_MIG_DATA_WRITE``            18         client -> server
+``VFIO_USER_DEVICE_IRQ_TRIGGER``        19         server -> client
 ======================================  =========  =================
 
 Header
@@ -533,9 +559,41 @@ Capabilities:
 |                    |         | handles server-to-client commands and their   |
 |                    |         | replies on a separate socket. Optional.       |
 +--------------------+---------+-----------------------------------------------+
+| irq_message        | object  | Message IRQ delivery support; optional.       |
+|                    |         | Added in version 0.3; see below.              |
++--------------------+---------+-----------------------------------------------+
 | write_multiple     | boolean | ``VFIO_USER_REGION_WRITE_MULTI`` messages     |
 |                    |         | are supported if the value is ``true``.       |
 +--------------------+---------+-----------------------------------------------+
+
+Message IRQ capability (added in version 0.3)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The optional ``irq_message`` capability is an object containing a boolean
+``supported`` member, defaulting to false. The client proposes support in
+``VFIO_USER_VERSION``; the server may return ``supported: true`` only if the
+client proposed true, the server supports this extension, and the negotiated
+minor version is at least 3. Otherwise it must omit the capability or return
+false. For example::
+
+    {"capabilities": {"irq_message": {"supported": true}}}
+
+The agreed version and mutual capability are both required. A version number
+alone does not enable message IRQs. Negotiation makes the delivery mechanism
+available; it does not enable any vector. A peer must not select message
+delivery or send IRQ notifications without agreement. This capability is
+independent of the transport and of ``twin_socket``.
+
+Existing eventfd behavior remains available on FD-capable transports. An old
+client with a new server, or a new client with an old server, continues to use
+existing eventfd configuration if supported. A transport that cannot pass FDs
+cannot fall back to eventfds: without agreement it can serve only device usage
+that does not require interrupts. That is a delivery limitation, not a separate
+class of IRQs; negotiated message delivery can represent INTx, MSI, MSI-X,
+ERR, and REQ subject to the device's advertised capabilities.
+
+Twin-socket capability
+^^^^^^^^^^^^^^^^^^^^^^
 
 The ``twin_socket`` capability object holds these name/value pairs:
 
@@ -1184,6 +1242,13 @@ Reply
 
   * ``VFIO_IRQ_INFO_EVENTFD`` indicates the IRQ type can support server eventfd
     signalling.
+  * ``VFIO_USER_IRQ_INFO_MESSAGE`` (bit 4, added in version 0.3) indicates
+    support for configuring message delivery for this IRQ index in the current
+    negotiated session. It must be clear without message IRQ agreement. It is
+    a support attribute, not an enabled/configured/masked status bit: configuring
+    or disabling vectors does not change it. It may coexist with EVENTFD when
+    both delivery mechanisms are supported. EVENTFD must not be advertised by
+    a transport unable to pass file descriptors.
   * ``VFIO_IRQ_INFO_MASKABLE`` indicates that the IRQ type supports the ``MASK``
     and ``UNMASK`` actions in a ``VFIO_USER_DEVICE_SET_IRQS`` message.
   * ``VFIO_IRQ_INFO_AUTOMASKED`` indicates the IRQ type masks itself after being
@@ -1243,7 +1308,8 @@ Request
 * *flags* defines the action performed on the interrupt range. The ``DATA``
   flags describe the data field sent in the message; the ``ACTION`` flags
   describe the action to be performed. The flags are mutually exclusive for
-  both sets.
+  both sets, except for the explicitly defined DATA_MESSAGE combinations
+  in `Message-based IRQ delivery`_ (added in version 0.3).
 
   * ``VFIO_IRQ_SET_DATA_NONE`` indicates there is no data field in the command.
     The action is performed unconditionally.
@@ -1312,6 +1378,148 @@ Reply
 ^^^^^
 
 There is no payload in the reply.
+
+.. _Message-based IRQ delivery:
+
+Message-based IRQ delivery (added in version 0.3)
+-------------------------------------------------
+
+``VFIO_USER_DEVICE_SET_IRQS`` remains a client-to-server control operation.
+The vfio-user-specific flag ``VFIO_USER_IRQ_SET_DATA_MESSAGE`` is bit 6 of its
+``flags`` field. It must not be passed to the kernel VFIO ioctl. This extension
+does not redefine Linux VFIO data/action masks.
+
+After mutual ``irq_message`` negotiation, the following forms configure delivery:
+
+* ``DATA_MESSAGE | ACTION_TRIGGER`` selects message delivery for every vector
+  in ``[start, start + count)``. There is no data payload; argsz is 20.
+* ``DATA_MESSAGE | DATA_BOOL | ACTION_TRIGGER`` selects message delivery only
+  for vectors whose corresponding boolean byte is 1. There are exactly count
+  bytes, each 0 or 1; argsz is 20 + count. A zero leaves that vector's existing
+  delivery and mask state unchanged; it does not disable or unmask it.
+
+Here DATA_MESSAGE abbreviates ``VFIO_USER_IRQ_SET_DATA_MESSAGE``; other names
+abbreviate the existing ``VFIO_IRQ_SET_*`` flags. These are the only valid
+DATA_MESSAGE combinations. DATA_NONE, DATA_EVENTFD, MASK, UNMASK, unknown bits,
+count zero, descriptors, or extra bytes are invalid in this configuration form.
+An all-zero boolean mask is a successful no-op after normal range validation.
+
+The server must validate negotiation, per-index support, flags, exact payload
+length, index, and overflow-safe vector bounds before changing any vector.
+Failure must leave the complete requested range unchanged. Configuring message
+delivery does not fire an interrupt. Reconfiguring an enabled vector changes
+its delivery mechanism without clearing explicit mask or INTx automask state;
+a newly enabled vector starts unmasked and not automasked. The reply has no
+payload, as with existing SET_IRQS operations.
+
+The following existing meanings are preserved:
+
+* ``DATA_EVENTFD`` with no descriptors deassigns the specified range; it never
+  selects message delivery. Deassignment disables the selected vectors even
+  when their previous delivery mechanism was messages.
+* ``DATA_NONE | ACTION_TRIGGER`` with start and count zero disables the index.
+* ``DATA_NONE`` or ``DATA_BOOL`` with MASK/UNMASK remains a mask-state operation.
+* ``DATA_NONE`` or ``DATA_BOOL`` with ACTION_TRIGGER and nonzero count requests
+  triggering through the configured mechanism; it does not configure delivery.
+
+Disabled and masked are different states. Capability agreement is not vector
+registration: clients must establish routing and explicitly enable delivery
+before unsolicited events can be sent. Existing IRQ-index constraints, including
+NORESIZE, remain in force. Clients needing to switch an active PCI interrupt
+mode must use the existing disable/configure sequence.
+
+A disabled vector has no delivery registration. A device trigger while disabled
+must not emit a message. Disable, reset, and disconnect clear the applicable
+message delivery and automask state. Device state retained across disconnect
+follows the existing disconnection rules; its interrupt source is re-evaluated
+only after a new client has configured delivery.
+
+For INTx message delivery, the server reports MASKABLE and AUTOMASKED and marks
+the vector automasked before publishing a trigger. It must not emit another
+while explicitly masked or automasked. The client's existing guest EOI path
+uses SET_IRQS ACTION_UNMASK; the server clears the mask/automask state and lets
+the device re-evaluate its interrupt level. A still-asserted source may trigger
+again; a source already cleared must not produce a stale replay. The device
+model retains responsibility for the level, including deassertion. No new guest
+acknowledgement protocol is introduced.
+
+MSI and MSI-X routing, PCI capability/table programming, vector masking, and
+pending-bit behavior retain their existing responsibilities in the device and
+client. Message delivery replaces the notification mechanism, not those PCI
+semantics. A client such as QEMU dispatches a received event into the same
+index/vector-specific guest-facing logic used after an eventfd notification.
+
+``VFIO_USER_DEVICE_IRQ_TRIGGER`` (added in version 0.3)
+-------------------------------------------------------
+
+This is a server-to-client event notification, command ID 19. It must use the
+main socket even when twin-socket mode is active. The header must have command
+type and No_reply set, with error fields clear. No descriptors are permitted.
+The body reuses VFIO IRQ addressing and has the following layout:
+
+========  ======  =========================================
+Field     Offset  Size
+========  ======  =========================================
+argsz     0       4
+flags     4       4
+index     8       4
+start     12      4
+count     16      4
+data      20      count bytes for DATA_BOOL; absent otherwise
+========  ======  =========================================
+
+Flags must be exactly ``ACTION_TRIGGER | DATA_NONE`` or
+``ACTION_TRIGGER | DATA_BOOL``. DATA_NONE triggers the complete range; DATA_BOOL
+triggers only entries with value 1, leaving others untouched. Boolean bytes
+must be 0 or 1. Count must be positive and the range must be in bounds without
+overflow. Argsz must equal the body length: 20 or 20 + count respectively.
+Every selected vector must have message delivery configured. The base
+protocol's endianness and message-size rules apply.
+
+MASK, UNMASK, DATA_MESSAGE, DATA_EVENTFD, count-zero disable, extra payload, and
+unknown flags are invalid. In particular, DATA_BOOL in an event selects the
+vectors that fired, whereas DATA_BOOL with DATA_MESSAGE in SET_IRQS selects
+vectors to configure. The event never changes routing or delivery configuration.
+
+The receiver must not reply, including on error. A malformed, wrong-direction,
+or unnegotiated event is a protocol error and terminates the session. A valid
+event received during a pending disable/reconfigure is handled according to the
+ordering rules below, not rejected merely because that request was submitted.
+A completed send does not mean the guest serviced the interrupt. There is no
+retry/replay across reconnect and no per-interrupt request/reply round trip.
+
+.. _Message-based IRQ ordering:
+
+Message-based IRQ ordering (added in version 0.3)
+-------------------------------------------------
+
+IRQ notifications and replies to client control requests share the main
+server-to-client stream. The server must serialize them in the order in which
+delivery state changes take effect. For a disable, replacement, or device reset,
+all notifications generated under the old configuration must precede the
+successful control reply; none may be generated under that configuration after
+it. Events under a newly enabled/replaced configuration must follow that reply.
+These guarantees apply to the affected vectors and to all vectors for reset.
+A failed configuration operation leaves the previous ordering/state in effect.
+
+A control request affecting message IRQ delivery or lifetime must require a
+reply; a client must not set No_reply for such SET_IRQS or reset requests.
+Unmask replies similarly precede events made possible by that unmask. A server
+that invokes device callbacks before replying must defer publication of any
+resulting IRQ event until the reply has been published.
+
+The client must demultiplex and process the main stream in order while waiting
+for replies. It must retain the old delivery/routing association until it has
+processed the control reply, then apply the replacement before processing later
+events. Its guest interrupt logic may suppress an event because the guest has
+already disabled that interrupt, but must not deliver an old event to a newly
+reused vector association. It must not defer IRQ handling past a control reply
+in a way that violates these associations. Disconnect terminates the stream and
+invalidates pending events; they cannot carry into a new connection.
+
+This design requires neither per-interrupt acknowledgements nor a new
+cross-channel barrier command. Twin-socket mode still separates DMA traffic;
+IRQ notifications deliberately stay on the ordered control-reply stream.
 
 .. _Read and Write Operations:
 
